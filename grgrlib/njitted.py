@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 
 import numpy as np
-from numba import njit, vectorize
-from math import erfc, pi
+from numba import njit, types, vectorize
+from numba.extending import intrinsic
+from math import erfc, frexp, ldexp, pi
 
 
 SQRT2 = np.sqrt(2.0)
@@ -290,16 +291,103 @@ def psd_func(M):
     return U, np.sum(np.log(d)), len(d)
 
 
+@intrinsic
+def _fma_float64(typingctx, a, b, c):
+    """Fused multiply-add with one rounding, including on Python before 3.13."""
+    def codegen(context, builder, signature, args):
+        return builder.fma(*args)
+
+    return types.float64(types.float64, types.float64, types.float64), codegen
+
+
+@njit(cache=True)
+def _mvn_cholesky(cov):
+    try:
+        lower = np.linalg.cholesky(cov)
+    except Exception:
+        # Numba only supports catching Exception here.
+        lower = np.empty_like(cov)
+    else:
+        # A rounded square root can leave a spurious positive pivot for exactly
+        # dependent rows. Check each pivot against its own marginal scale.
+        tol = len(cov) * np.finfo(np.float64).eps * np.diag(cov)
+        if np.all(np.diag(lower) ** 2 > tol):
+            return lower
+
+    # Recompute the Schur complements without square roots. Subtract the two
+    # cross-products before dividing so proportional rows cancel directly.
+    # Scaling the pivot by a power of two avoids squaring the covariance scale.
+    schur = cov.copy()
+    for j in range(len(cov)):
+        pivot = schur[j, j]
+        if pivot <= 0:
+            return np.empty((0, 0))
+        mantissa, exponent = frexp(pivot)
+        lower[j, j] = np.sqrt(pivot)
+        for i in range(j + 1, len(cov)):
+            scaled = ldexp(schur[i, j], -exponent)
+            lower[i, j] = schur[i, j] / lower[j, j]
+            for k in range(j + 1, i + 1):
+                product = scaled * schur[k, j]
+                error = _fma_float64(-scaled, schur[k, j], product)
+                diff = _fma_float64(mantissa, schur[i, k], -product)
+                schur[i, k] = (diff + error) / mantissa
+    return lower
+
+
+@njit(cache=True)
+def _mvn_logpdf_rows(dev, cov):
+    dim = cov.shape[0]
+    if dim == 0 or cov.shape[1] != dim or dev.shape[1] != dim:
+        raise ValueError("cov must be square and match the observation dimension")
+    if not np.all(np.isfinite(cov)):
+        raise ValueError("cov must contain only finite values")
+
+    log_2pi = np.log(2 * np.pi)
+    roundoff = dim * np.finfo(np.float64).eps
+    lower = _mvn_cholesky(cov)
+    if lower.size == 0:
+        values, vectors = np.linalg.eigh(cov)
+        # Bound eigenvalue roundoff on each direction's own scale.
+        abs_vectors = np.abs(vectors)
+        tol = roundoff * np.sum(abs_vectors * (np.abs(cov) @ abs_vectors), axis=0)
+        if np.any(values < -tol):
+            raise ValueError("cov must be positive semidefinite")
+        positive = values > tol
+        coordinates = dev @ vectors
+        scaled = coordinates[:, positive] / np.sqrt(values[positive])
+        log_norm = np.sum(positive) * log_2pi + np.sum(np.log(values[positive]))
+        out = -0.5 * (log_norm + np.sum(scaled ** 2, axis=1))
+
+        # Allow for cancellation in the projection onto the null space.
+        null_tol = roundoff * (np.abs(dev) @ abs_vectors[:, ~positive])
+        for i in range(len(out)):
+            if np.any(np.abs(coordinates[i, ~positive]) > null_tol[i]):
+                out[i] = -np.inf
+        return out
+
+    log_norm = dim * log_2pi + 2 * np.sum(np.log(np.diag(lower)))
+    out = np.empty(dev.shape[0])
+    whitened = np.empty(dim)
+    for i in range(len(out)):
+        for j in range(dim):
+            residual = dev[i, j]
+            for k in range(j):
+                residual -= lower[j, k] * whitened[k]
+            whitened[j] = residual / lower[j, j]
+        out[i] = -0.5 * (log_norm + np.dot(whitened, whitened))
+    return out
+
+
 @njit(cache=True)
 def mvn_logpdf(x, mean, cov):
-    """log-PDF of multivariate normal"""
+    """Gaussian log-density for one observation or a batch of observation rows.
 
-    _LOG_2PI = np.log(2 * np.pi)
-
-    dim = mean.shape[0]
-    prec_U, log_det_cov, rank = psd_func(cov)
-    dev = x - mean
-    maha = np.sum(np.square(np.dot(dev, prec_U)), axis=-1)
-    out = -0.5 * (rank * _LOG_2PI + log_det_cov + maha)
-
-    return out
+    For singular covariances the density is relative to the affine support
+    through mean. Observations outside that support have log-density -inf.
+    """
+    dev = np.asarray(x - mean, dtype=np.float64)
+    rows = np.atleast_2d(dev)
+    out = _mvn_logpdf_rows(rows, np.asarray(cov, dtype=np.float64))
+    # Empty-tuple indexing unboxes a scalar and preserves a batch of length one.
+    return out.reshape(dev.shape[:-1])[()]
